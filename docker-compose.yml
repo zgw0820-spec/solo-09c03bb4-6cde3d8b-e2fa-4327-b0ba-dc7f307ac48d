@@ -12,14 +12,12 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+    # 号段分配/补录均为短事务，保留默认死锁检测即可；lock_timeout 仅用于
+    # 同段补录排队时快速失败，由 API 端 SET LOCAL 下发，不要求库级配置。
     command:
       - "postgres"
       - "-c"
-      - "deadlock_timeout=200ms"
-      - "-c"
       - "lock_timeout=10s"
-      - "-c"
-      - "log_lock_waits=on"
 
   api:
     build: .
@@ -28,8 +26,9 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/patrol
-      TRIAL_SCHEMA: deadlock_trial
+      ORDER_PREFIX: "OFF-"
+      MIN_QUANTITY: "1"
+      MAX_QUANTITY: "50"
       LOCK_TIMEOUT_MS: "10000"
-      TRIAL_TIMEOUT_S: "30"
     ports:
       - "8000:8000"

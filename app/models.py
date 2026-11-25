@@ -1,176 +1,156 @@
 """请求/响应数据模型与入参校验。
 
-规则：
-- 2~3 批，每批 1~6 单；
-- 工单号在同一批内不允许重复（同号并发试验互不阻塞，见 README）；
-- 每批是一笔事务，按列表原顺序逐单 UPDATE，行锁持有到事务结束。
+业务规则
+========
+领号（进无网区前）：
+- 终端标识 + 请求号唯一确定一次领号；数量 1~50；
+- 同终端用原请求号、原数量重试 -> 幂等返回原号段；改数量 -> 409 拒绝。
+
+补录（恢复联网后）：
+- 携带终端标识与领号请求号，定位当时领到的号段；
+- 工单号可乱序提交，但必须全部落在号段内；
+- 同号同负责人重复提交视为成功（幂等）；
+- 同号异负责人、段外编号 -> 报出单号，整批不入库。
 """
 
 from __future__ import annotations
 
+import re
 from typing import List, Optional
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 
 from .config import settings
 
+# 工单号格式：前缀 + 正整数（不允许前导 0、负数、非数字）
+ORDER_ID_RE = re.compile(
+    r"^" + re.escape(settings.order_prefix) + r"[1-9][0-9]*$"
+)
 
-class BatchInput(BaseModel):
-    batch_id: str = Field(..., min_length=1, max_length=64, description="批次标识")
-    order_ids: List[str] = Field(
-        ...,
-        min_length=1,
-        max_length=settings.max_orders_per_batch,
-        description="本批工单号，顺序即事务内加锁顺序",
+
+def is_valid_order_id(order_id: str) -> bool:
+    return bool(ORDER_ID_RE.fullmatch(order_id or ""))
+
+
+def make_order_id(no: int) -> str:
+    return f"{settings.order_prefix}{no}"
+
+
+class AllocateRequest(BaseModel):
+    terminal_id: str = Field(
+        ..., min_length=1, max_length=64, description="终端标识（如设备 SN）"
     )
-    assignee: str = Field(..., min_length=1, max_length=64, description="目标负责人")
-
-    @field_validator("order_ids")
-    @classmethod
-    def _no_duplicate_in_batch(cls, v: List[str]) -> List[str]:
-        seen: set[str] = set()
-        for oid in v:
-            if oid in seen:
-                raise ValueError(
-                    f"工单号 {oid} 在同一批内重复；同号并发试验互不阻塞，重复项无意义"
-                )
-            seen.add(oid)
-        return v
-
-
-class PrecheckRequest(BaseModel):
-    batches: List[BatchInput] = Field(
-        ...,
-        description=f"{settings.min_batches}~{settings.max_batches} 批有序工单",
-        json_schema_extra={
-            "examples": [
-                {
-                    "batch_id": "B1",
-                    "order_ids": ["W1", "W2"],
-                    "assignee": "alice",
-                },
-                {
-                    "batch_id": "B2",
-                    "order_ids": ["W2", "W1"],
-                    "assignee": "bob",
-                },
-            ]
-        },
+    request_no: str = Field(
+        ..., min_length=1, max_length=64, description="领号请求号，终端内唯一"
     )
-    run_replay: bool = Field(
-        default=True,
-        description="发现死锁时是否在本地测试库按交错顺序实跑复现",
+    quantity: int = Field(
+        ...,
+        ge=settings.min_quantity,
+        le=settings.max_quantity,
+        description=f"领取数量（{settings.min_quantity}~{settings.max_quantity}）",
     )
 
     model_config = {
         "json_schema_extra": {
             "examples": [
                 {
-                    "summary": "AB-BA 死锁（必现 40P01）",
-                    "value": {
-                        "batches": [
-                            {"batch_id": "B1", "order_ids": ["W1", "W2"],
-                             "assignee": "alice"},
-                            {"batch_id": "B2", "order_ids": ["W2", "W1"],
-                             "assignee": "bob"},
-                        ],
-                        "run_replay": True,
-                    },
-                },
-                {
-                    "summary": "三节点循环等锁",
-                    "value": {
-                        "batches": [
-                            {"batch_id": "B1", "order_ids": ["W1", "W2"],
-                             "assignee": "a1"},
-                            {"batch_id": "B2", "order_ids": ["W2", "W3"],
-                             "assignee": "a2"},
-                            {"batch_id": "B3", "order_ids": ["W3", "W1"],
-                             "assignee": "a3"},
-                        ],
-                        "run_replay": True,
-                    },
-                },
-                {
-                    "summary": "同顺序安全批次（无死锁）",
-                    "value": {
-                        "batches": [
-                            {"batch_id": "B1",
-                             "order_ids": ["W1", "W2", "W3"],
-                             "assignee": "alice"},
-                            {"batch_id": "B2",
-                             "order_ids": ["W9", "W1", "W2"],
-                             "assignee": "bob"},
-                        ],
-                        "run_replay": True,
-                    },
-                },
+                    "terminal_id": "PDA-001",
+                    "request_no": "REQ-20261125-001",
+                    "quantity": 5,
+                }
             ]
         }
     }
 
-    @model_validator(mode="after")
-    def _check_batch_count(self) -> "PrecheckRequest":
-        n = len(self.batches)
-        if not (settings.min_batches <= n <= settings.max_batches):
-            raise ValueError(
-                f"批次数必须在 {settings.min_batches}~{settings.max_batches} 之间，收到 {n} 批"
-            )
-        ids = [b.batch_id for b in self.batches]
-        if len(set(ids)) != len(ids):
-            raise ValueError("batch_id 不允许重复")
-        return self
 
-
-class WaitEdge(BaseModel):
-    """等待边：waiter 批次在执行 order_id 时等待 holder 批次释放行锁。"""
-
-    waiter_batch: str
-    holder_batch: str
-    order_id: str
-    waiter_step: int = Field(..., description="等待方在本批中的第几步（从 1 开始）")
-    holder_step: int = Field(..., description="持有方在本批中的第几步（从 1 开始）")
-
-
-class CycleReport(BaseModel):
-    cycle_batches: List[str] = Field(..., description="构成循环的批次顺序，首尾相接")
-    cycle_orders: List[str] = Field(
-        ...,
-        description="循环边上的工单号，与 cycle_batches 等长，"
-        "cycle_batches[i] 在 cycle_orders[i] 上等待下一个批次",
+class AllocateResponse(BaseModel):
+    terminal_id: str
+    request_no: str
+    quantity: int
+    start_order_id: str = Field(..., description="号段起始工单号，含")
+    end_order_id: str = Field(..., description="号段结束工单号，含")
+    order_ids: List[str] = Field(..., description="号段内全部连续工单号")
+    retried: bool = Field(
+        ..., description="false=本次新领；true=同请求号重试，返回原号段"
     )
-    edges: List[WaitEdge] = Field(..., description="参与循环的等待边")
 
 
-class ReplayStep(BaseModel):
-    seq: int = Field(..., description="全局执行序号，从 1 开始")
-    batch_id: str
-    step: int = Field(..., description="批次内第几步，从 1 开始")
-    order_id: str
-    action: str = Field(..., description="acquire(拿到锁)/block(阻塞等待)/abort(被死锁检测中止)")
-    note: Optional[str] = None
+class BackfillItem(BaseModel):
+    order_id: str = Field(
+        ..., min_length=1, max_length=64, description="工单号，如 OFF-123"
+    )
+    assignee: str = Field(..., min_length=1, max_length=64, description="负责人")
+
+    @field_validator("order_id")
+    @classmethod
+    def _check_format(cls, v: str) -> str:
+        if not is_valid_order_id(v):
+            raise ValueError(
+                f"工单号 {v!r} 格式非法，应为 {settings.order_prefix}<正整数>"
+            )
+        return v
 
 
-class BatchWait(BaseModel):
-    batch_id: str
-    waits_for_order: str = Field(..., description="该批最终阻塞在哪张工单上")
-    waits_for_holder: str = Field(..., description="当前持有该工单行锁的批次")
-    last_acquired_step: int = Field(..., description="阻塞前已完成到本批第几步")
+class BackfillRequest(BaseModel):
+    terminal_id: str = Field(..., min_length=1, max_length=64, description="终端标识")
+    request_no: str = Field(
+        ..., min_length=1, max_length=64, description="领号时使用的请求号"
+    )
+    items: List[BackfillItem] = Field(
+        ...,
+        min_length=1,
+        max_length=settings.max_quantity,
+        description="本号段工单的补录条目，允许乱序",
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "terminal_id": "PDA-001",
+                    "request_no": "REQ-20261125-001",
+                    "items": [
+                        {"order_id": "OFF-3", "assignee": "alice"},
+                        {"order_id": "OFF-1", "assignee": "bob"},
+                        {"order_id": "OFF-2", "assignee": "alice"},
+                    ],
+                }
+            ]
+        }
+    }
 
 
-class ReplayReport(BaseModel):
-    reproduced: bool
-    sqlstate: Optional[str] = Field(None, description="复现到的 SQLSTATE，期望 40P01")
-    victim_batch: Optional[str] = None
-    detail: Optional[str] = None
-    steps: List[ReplayStep] = Field(default_factory=list)
-    batch_waits: List[BatchWait] = Field(default_factory=list)
-    cleanup_ok: bool = Field(..., description="试跑结束后是否无残留事务、无残留改派结果")
-
-
-class PrecheckResponse(BaseModel):
-    has_deadlock: bool
-    cycles: List[CycleReport] = Field(default_factory=list)
-    wait_edges: List[WaitEdge] = Field(default_factory=list, description="完整等待图")
-    replay: Optional[ReplayReport] = None
+class BackfillResponse(BaseModel):
+    terminal_id: str
+    request_no: str
+    received: int = Field(..., description="本次请求条目数（去重前）")
+    inserted: int = Field(..., description="新写入工单数")
+    already_present: int = Field(
+        ..., description="同号同负责人、视为成功而跳过的工单数"
+    )
+    order_ids: List[str] = Field(..., description="本次涉及的全部工单号（升序）")
     message: str
+
+
+class SegmentView(BaseModel):
+    terminal_id: str
+    request_no: str
+    quantity: int
+    start_order_id: str
+    end_order_id: str
+    created_at: str
+
+
+class OrderView(BaseModel):
+    order_id: str
+    assignee: str
+
+
+class BatchError(BaseModel):
+    """整批拒绝时的错误体：报出全部问题单号，且保证整批不入库。"""
+
+    error: str
+    out_of_range_orders: List[str] = Field(default_factory=list)
+    conflict_orders: List[str] = Field(default_factory=list)
+    malformed_orders: Optional[List[str]] = None
+    detail: str

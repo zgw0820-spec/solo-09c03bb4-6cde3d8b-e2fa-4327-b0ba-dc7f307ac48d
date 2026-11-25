@@ -1,75 +1,161 @@
-"""PostgreSQL 访问层与死锁实跑执行器。
+"""PostgreSQL 访问层：号段分配与补录入库。
 
-试跑隔离
-========
-- 所有试跑在独立 schema ``deadlock_trial`` 下的临时表进行，与业务表
-  ``public.work_orders`` 物理隔离；
-- 每轮试跑 DROP SCHEMA ... CASCADE 后重建，上一轮的行、锁、改派结果
-  全部物理清除；
-- 每批一个独立连接/线程，事务只可能 COMMIT 或 ROLLBACK，结束后连接
-  归还并关闭；试跑收尾再用 ``pg_stat_activity`` 核查无未结束事务、
-  用全表扫描核查无改派残留。
+并发与持久化保证
+================
+1. 号段分配
+   - ``allocation_meta`` 单行计数器，分配事务内 ``SELECT ... FOR UPDATE``
+     取号并推进，号段在数据库层面串行生成，**并发领号绝不重叠**；
+   - 号段落在独立表 ``order_segments``，(terminal_id, request_no) 唯一约束，
+     同终端同请求号重试直接回读原号段，改数量则抛 :class:`AllocationConflict`；
+   - 计数器与号段均持久化，**服务/数据库重启后不会重发已领号码**；
+   - 分配前扫描 ``work_orders`` 中已存在的 ``OFF-n``（旧库迁移数据、
+     历史数据），计数器水位低于已用编号时整体跳过，**旧库已用编号必避开**。
+
+2. 补录
+   - 每笔补录是一个事务，先 ``SELECT ... FOR UPDATE`` 锁定本号段行：
+     同段并发补录串行化，段间争用不同的行，**一段事务卡住不阻塞其他段**；
+   - 段外编号、同号异负责人全部在写入前检出，任一存在即回滚，
+     **整批不入库**；同号同负责人直接跳过，视为成功（幂等）。
 """
 
 from __future__ import annotations
 
-import threading
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+import re
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import psycopg
-from psycopg import sql
 
 from .config import settings
-from .models import (
-    BatchInput,
-    BatchWait,
-    CycleReport,
-    ReplayReport,
-    ReplayStep,
-)
+from .models import make_order_id
 
-DEADLOCK_SQLSTATE = "40P01"
+# 已领号段的编号前缀（与 models.ORDER_ID_RE 同源，SQL 正则转义用）
+_PREFIX_PATTERN = "^" + re.escape(settings.order_prefix) + r"[0-9]+$"
+_PREFIX_LIKE = f"{settings.order_prefix}%"
+# SUBSTRING(x FROM int) 取该位置起的子串；必须是整数而非字符串模式
+_PREFIX_CUT = len(settings.order_prefix) + 1
 
 
+# --------------------------------------------------------------------------- #
+# 业务异常
+# --------------------------------------------------------------------------- #
+class AllocationConflict(Exception):
+    """同终端同请求号已领号，但本次重试数量与原数量不一致。"""
+
+    def __init__(self, terminal_id: str, request_no: str,
+                 requested: int, existing: int) -> None:
+        self.terminal_id = terminal_id
+        self.request_no = request_no
+        self.requested = requested
+        self.existing = existing
+        super().__init__(
+            f"终端 {terminal_id} 的请求号 {request_no} 已领取数量 {existing}，"
+            f"不能以数量 {requested} 重复领取"
+        )
+
+
+class SegmentNotFound(Exception):
+    """补录携带的终端标识/请求号找不到对应号段。"""
+
+    def __init__(self, terminal_id: str, request_no: str) -> None:
+        self.terminal_id = terminal_id
+        self.request_no = request_no
+        super().__init__(
+            f"终端 {terminal_id} 的请求号 {request_no} 未领取过号段，"
+            "请先调用领号接口"
+        )
+
+
+@dataclass
+class BackfillRejected(Exception):
+    """补录批次校验失败：报出全部问题单号，整批不入库。"""
+
+    out_of_range_orders: List[str]
+    conflict_orders: List[str]
+
+    def __post_init__(self) -> None:
+        parts = []
+        if self.out_of_range_orders:
+            parts.append(f"段外编号 {self.out_of_range_orders}")
+        if self.conflict_orders:
+            parts.append(f"同号异负责人 {self.conflict_orders}")
+        super().__init__("；".join(parts))
+
+
+# --------------------------------------------------------------------------- #
+# 连接与建表
+# --------------------------------------------------------------------------- #
 def connect(autocommit: bool = False) -> psycopg.Connection:
-    conn = psycopg.connect(settings.database_url, autocommit=autocommit)
-    return conn
+    return psycopg.connect(settings.database_url, autocommit=autocommit)
 
 
-# --------------------------------------------------------------------------- #
-# 业务表（演示用，真实环境由迁移脚本维护）
-# --------------------------------------------------------------------------- #
 def ensure_business_schema() -> None:
+    """建表并初始化分配计数器（幂等，可重复执行、可在重启后执行）。"""
     with connect(autocommit=True) as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS public.work_orders (
                 order_id   text PRIMARY KEY,
                 assignee   text NOT NULL,
+                source     text NOT NULL DEFAULT 'seed',
+                created_at timestamptz NOT NULL DEFAULT now(),
                 updated_at timestamptz NOT NULL DEFAULT now()
             )
             """
         )
-
-
-def seed_orders(order_ids: List[str]) -> None:
-    """确保工单行存在（幂等），负责人初始为 'init'。"""
-    if not order_ids:
-        return
-    ensure_business_schema()
-    with connect(autocommit=True) as conn, conn.cursor() as cur:
-        cur.executemany(
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS public.order_segments (
+                terminal_id text NOT NULL,
+                request_no  text NOT NULL,
+                quantity    integer NOT NULL
+                            CHECK (quantity BETWEEN {int(settings.min_quantity)}
+                                                  AND {int(settings.max_quantity)}),
+                start_no    bigint NOT NULL,
+                end_no      bigint NOT NULL,
+                created_at  timestamptz NOT NULL DEFAULT now(),
+                PRIMARY KEY (terminal_id, request_no),
+                CHECK (end_no - start_no + 1 = quantity)
+            )
             """
-            INSERT INTO public.work_orders(order_id, assignee)
-            VALUES (%s, 'init')
-            ON CONFLICT (order_id) DO NOTHING
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS public.allocation_meta (
+                id      smallint PRIMARY KEY DEFAULT 1,
+                next_no bigint NOT NULL,
+                CHECK (id = 1)
+            )
+            """
+        )
+        # 计数器初值 = 旧库/已领号段中最大 OFF 编号 + 1，保证重启不重号、
+        # 旧库已用编号被避开。仅在 meta 尚无行时写入。
+        conn.execute(
+            """
+            INSERT INTO public.allocation_meta(id, next_no)
+            SELECT 1, GREATEST(
+                (
+                    SELECT COALESCE(MAX(SUBSTRING(order_id FROM %s)::bigint), 0) + 1
+                    FROM public.work_orders
+                    WHERE order_id LIKE %s
+                      AND order_id ~ %s
+                ),
+                (SELECT COALESCE(MAX(end_no), 0) + 1 FROM public.order_segments),
+                1
+            )
+            WHERE NOT EXISTS (SELECT 1 FROM public.allocation_meta)
             """,
-            [(oid,) for oid in sorted(set(order_ids))],
+            (
+                _PREFIX_CUT,
+                _PREFIX_LIKE,
+                _PREFIX_PATTERN,
+            ),
         )
 
 
+# --------------------------------------------------------------------------- #
+# 工单查询与种子数据
+# --------------------------------------------------------------------------- #
 def list_orders() -> List[Tuple[str, str]]:
     ensure_business_schema()
     with connect(autocommit=True) as conn:
@@ -78,396 +164,238 @@ def list_orders() -> List[Tuple[str, str]]:
         ).fetchall()
 
 
-# --------------------------------------------------------------------------- #
-# 试跑 schema 管理
-# --------------------------------------------------------------------------- #
-def reset_trial_schema(conn: psycopg.Connection) -> None:
-    conn.execute(
-        sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
-            sql.Identifier(settings.trial_schema)
-        )
-    )
-    conn.execute(
-        sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(settings.trial_schema))
-    )
-    conn.execute(
-        sql.SQL(
-            """
-            CREATE TABLE {schema}.work_orders (
-                order_id   text PRIMARY KEY,
-                assignee   text NOT NULL,
-                updated_at timestamptz NOT NULL DEFAULT now()
-            )
-            """
-        ).format(schema=sql.Identifier(settings.trial_schema))
-    )
+def seed_orders(order_ids: List[str]) -> None:
+    """幂等写入普通编号测试工单（source='seed'），不触碰已存在行。
 
-
-def _trial_table() -> sql.Composed:
-    return sql.SQL("{}.work_orders").format(sql.Identifier(settings.trial_schema))
-
-
-# --------------------------------------------------------------------------- #
-# 实跑执行器
-# --------------------------------------------------------------------------- #
-@dataclass
-class _BatchRun:
-    batch: BatchInput
-    error_sqlstate: Optional[str] = None
-    error_message: Optional[str] = None
-    committed: bool = False
-    blocked_order: Optional[str] = None
-    blocked_holder: Optional[str] = None
-    last_step: int = 0
-    steps: List[ReplayStep] = field(default_factory=list)
-
-
-def _holder_of(admin_conn: psycopg.Connection, order_id: str) -> Optional[str]:
-    """查当前持有指定工单行锁的试跑后端 pid。
-
-    PostgreSQL 的行锁不体现在 pg_locks（tuple 锁只在阻塞等待时出现），
-    持有者事务 id 记录在行头 xmax。通过 pg_stat_activity.backend_xid
-    关联即可拿到持有行锁的后端。返回 pid 字符串，查不到返回 None。
+    领号产生的 ``OFF-n`` 编号空间受保护，种子接口拒绝写入该前缀编号，
+    即原 /orders/seed 只新增普通编号。
     """
-    row = admin_conn.execute(
-        sql.SQL(
-            """
-            SELECT a.pid
-            FROM {tbl} w
-            JOIN pg_stat_activity a
-              ON a.backend_xid = w.xmax
-            WHERE w.order_id = %s
-              AND a.datname = current_database()
-              AND a.pid <> pg_backend_pid()
-            LIMIT 1
-            """
-        ).format(tbl=_trial_table()),
-        (order_id,),
-    ).fetchone()
-    return str(row[0]) if row else None
-
-
-def _update_order(conn: psycopg.Connection, order_id: str, assignee: str) -> None:
-    conn.execute(
-        sql.SQL(
-            "UPDATE {tbl} SET assignee = %s, updated_at = now() WHERE order_id = %s"
-        ).format(tbl=_trial_table()),
-        (assignee, order_id),
-    )
-
-
-def _is_waiting(admin_conn: psycopg.Connection, pid: int) -> Optional[str]:
-    """指定后端当前是否在等锁；返回等待事件名，否则 None。"""
-    row = admin_conn.execute(
-        """
-        SELECT wait_event_type, wait_event
-        FROM pg_stat_activity
-        WHERE pid = %s AND wait_event_type = 'Lock'
-        """,
-        (pid,),
-    ).fetchone()
-    return f"{row[0]}.{row[1]}" if row else None
-
-
-def replay_deadlock(
-    batches: List[BatchInput], cycle: CycleReport
-) -> ReplayReport:
-    """按检测到的环构造交错调度并实跑，验证是否收到 SQLSTATE 40P01。"""
-    admin = connect(autocommit=True)
-    admin.execute(f"SET lock_timeout = {int(settings.lock_timeout_ms)}")
-    reset_trial_schema(admin)
-    try:
-        return _replay_inner(batches, cycle, admin)
-    finally:
-        # 任何异常路径都不允许遗留试跑 schema / 未结束事务
-        try:
-            admin.execute(
-                sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
-                    sql.Identifier(settings.trial_schema)
-                )
-            )
-        finally:
-            admin.close()
-
-
-def _replay_inner(
-    batches: List[BatchInput],
-    cycle: CycleReport,
-    admin: psycopg.Connection,
-) -> ReplayReport:
-    all_orders = sorted({oid for b in batches for oid in b.order_ids})
-    with admin.cursor() as cur:
+    if not order_ids:
+        return
+    ensure_business_schema()
+    with connect(autocommit=True) as conn, conn.cursor() as cur:
         cur.executemany(
-            sql.SQL(
-                "INSERT INTO {tbl}(order_id, assignee) VALUES (%s, 'init')"
-            ).format(tbl=_trial_table()),
-            [(oid,) for oid in all_orders],
+            """
+            INSERT INTO public.work_orders(order_id, assignee, source)
+            VALUES (%s, 'init', 'seed')
+            ON CONFLICT (order_id) DO NOTHING
+            """,
+            [(oid,) for oid in sorted(set(order_ids))],
         )
 
-    # 环上的批次（cycle_batches 不重复），cycle_orders[k] 是
-    # cycle_batches[k] 等待下一个批次时所争用的工单。
-    cyc_batches = cycle.cycle_batches
-    cyc_orders = cycle.cycle_orders
-    n = len(cyc_batches)
 
-    # 每个环上批次的"阻塞工单"= 它等待的下一个批次先拿到的那张单
-    block_order: Dict[str, str] = {}
-    for k, bid in enumerate(cyc_batches):
-        block_order[bid] = cyc_orders[k]
+# --------------------------------------------------------------------------- #
+# 领号
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class Segment:
+    terminal_id: str
+    request_no: str
+    quantity: int
+    start_no: int
+    end_no: int
+    retried: bool
+    created_at: str = ""
 
-    # 非环上批次（三批输入、二环时存在）按各自完整顺序参与调度，
-    # 它们不持有环上的争用单（否则也会在环里），正常跑完即可。
+    @property
+    def order_ids(self) -> List[str]:
+        return [make_order_id(n) for n in range(self.start_no, self.end_no + 1)]
 
-    barrier = threading.Barrier(len(batches))
-    runs: Dict[str, _BatchRun] = {
-        b.batch_id: _BatchRun(batch=b) for b in batches
-    }
-    seq_lock = threading.Lock()
-    seq_counter = {"v": 0}
+    @property
+    def start_order_id(self) -> str:
+        return make_order_id(self.start_no)
 
-    def next_seq() -> int:
-        with seq_lock:
-            seq_counter["v"] += 1
-            return seq_counter["v"]
+    @property
+    def end_order_id(self) -> str:
+        return make_order_id(self.end_no)
 
-    def worker(batch: BatchInput) -> None:
-        run = runs[batch.batch_id]
-        conn = connect()
-        conn.execute(f"SET lock_timeout = {int(settings.lock_timeout_ms)}")
-        own_pid = conn.execute("SELECT pg_backend_pid()").fetchone()[0]
-        block_recorded = threading.Event()
+
+def allocate(terminal_id: str, request_no: str, quantity: int) -> Segment:
+    """领取一段连续 OFF 编号；同请求号重试返回原号段，改数量抛冲突。
+
+    并发同 (terminal_id, request_no) 请求可能同时通过首查、在 INSERT 上
+    撞唯一约束：输家事务整体回滚（计数器推进一并撤销，不浪费号码），
+    重试时回读赢家已提交的原号段。
+    """
+    ensure_business_schema()
+    last_exc: Exception | None = None
+    for attempt in range(3):
         try:
-            conn.execute("BEGIN")
-            for step, oid in enumerate(batch.order_ids, start=1):
-                # 锁步：保证环上各批按同一全局节拍交错，避免某个批次抢跑
-                # 直接拿齐两把锁把死锁退化成普通等待。
-                barrier.wait(settings.trial_timeout_s)
-
-                # UPDATE 放在内部线程执行，本线程轮询 pg_stat_activity：
-                # 一旦观察到本后端进入 Lock 等待，先落一条 block 记录。
-                update_err: dict[str, Exception] = {}
-
-                def do_update() -> None:
-                    try:
-                        _update_order(conn, oid, batch.assignee)
-                    except Exception as exc:  # noqa: BLE001
-                        update_err["exc"] = exc
-
-                ut = threading.Thread(target=do_update, daemon=True)
-                ut.start()
-                while ut.is_alive():
-                    ut.join(timeout=0.02)
-                    wait = _is_waiting(admin, own_pid)
-                    if wait and not block_recorded.is_set():
-                        run.blocked_order = oid
-                        run.blocked_holder = _holder_of(admin, oid)
-                        run.steps.append(
-                            ReplayStep(
-                                seq=next_seq(),
-                                batch_id=batch.batch_id,
-                                step=step,
-                                order_id=oid,
-                                action="block",
-                                note=(
-                                    f"进入锁等待（{wait}），持有方连接 "
-                                    f"pid={run.blocked_holder}"
-                                ),
-                            )
-                        )
-                        block_recorded.set()
-                if "exc" in update_err:
-                    exc = update_err["exc"]
-                    if isinstance(exc, psycopg.errors.DeadlockDetected):
-                        run.error_sqlstate = exc.sqlstate
-                        run.error_message = str(exc).strip()
-                        run.blocked_order = oid
-                        run.last_step = step - 1
-                        run.steps.append(
-                            ReplayStep(
-                                seq=next_seq(),
-                                batch_id=batch.batch_id,
-                                step=step,
-                                order_id=oid,
-                                action="abort",
-                                note=(
-                                    "PostgreSQL 死锁检测中止本事务，"
-                                    f"SQLSTATE={exc.sqlstate}"
-                                ),
-                            )
-                        )
-                        conn.rollback()
-                        return
-                    if isinstance(exc, psycopg.errors.LockNotAvailable):
-                        run.error_sqlstate = exc.sqlstate
-                        run.error_message = str(exc).strip()
-                        run.blocked_order = oid
-                        run.last_step = step - 1
-                        if not block_recorded.is_set():
-                            run.steps.append(
-                                ReplayStep(
-                                    seq=next_seq(),
-                                    batch_id=batch.batch_id,
-                                    step=step,
-                                    order_id=oid,
-                                    action="block",
-                                    note=(
-                                        f"lock_timeout {settings.lock_timeout_ms}ms"
-                                        " 触发，未及采样到等待事件"
-                                    ),
-                                )
-                            )
-                        conn.rollback()
-                        return
-                    raise exc
-                # UPDATE 正常返回：行锁已到手（若此前在等待，等待已结束）
-                run.last_step = step
-                run.steps.append(
-                    ReplayStep(
-                        seq=next_seq(),
-                        batch_id=batch.batch_id,
-                        step=step,
-                        order_id=oid,
-                        action="acquire",
-                        note="曾阻塞等待后获得锁"
-                        if block_recorded.is_set()
-                        else None,
-                    )
+            # 普通事务，with 退出时 COMMIT，异常时 ROLLBACK 并关闭连接
+            with connect() as conn:
+                conn.execute(
+                    f"SET LOCAL lock_timeout = {int(settings.lock_timeout_ms)}"
                 )
-                block_recorded.clear()
-            conn.execute("COMMIT")
-            run.committed = True
-        except Exception:  # noqa: BLE001 - 试跑线程内兜底，保证连接关闭
-            try:
-                conn.rollback()
-            except Exception:  # pragma: no cover
-                pass
-            raise
-        finally:
-            try:
-                conn.close()
-            except Exception:  # pragma: no cover
-                pass
 
-    timeout = settings.trial_timeout_s + 5
-    with ThreadPoolExecutor(max_workers=len(batches)) as pool:
-        futures = [pool.submit(worker, b) for b in batches]
-        worker_errors: List[str] = []
-        for f in futures:
-            try:
-                f.result(timeout=timeout)
-            except FutTimeout:
-                worker_errors.append("试跑线程整体超时")
-            except Exception as exc:  # noqa: BLE001
-                worker_errors.append(f"{type(exc).__name__}: {exc}")
+                row = conn.execute(
+                    """
+                    SELECT quantity, start_no, end_no
+                    FROM public.order_segments
+                    WHERE terminal_id = %s AND request_no = %s
+                    """,
+                    (terminal_id, request_no),
+                ).fetchone()
+                if row is not None:
+                    existing_qty, start_no, end_no = row
+                    if existing_qty != quantity:
+                        raise AllocationConflict(
+                            terminal_id, request_no, quantity, existing_qty
+                        )
+                    return Segment(terminal_id, request_no, existing_qty,
+                                   start_no, end_no, retried=True)
+                # 锁单行计数器：并发领号在此串行，号段不可能重叠
+                next_no = conn.execute(
+                    "SELECT next_no FROM public.allocation_meta "
+                    "WHERE id = 1 FOR UPDATE"
+                ).fetchone()[0]
 
-    # 阻塞信息补全：被死锁检测中止时当前事务已回滚，持锁方可能已查不到，
-    # 用等待图静态信息补齐 holder 批次。
-    holder_by_order: Dict[str, str] = {}
-    for k, bid in enumerate(cyc_batches):
-        holder_by_order[cyc_orders[k]] = cyc_batches[(k + 1) % n]
+                # 双保险：扫描旧库/历史已用 OFF 编号与已领号段，水位不足则跳过
+                used_max = conn.execute(
+                    """
+                    SELECT COALESCE(MAX(n), 0) FROM (
+                        SELECT SUBSTRING(order_id FROM %s)::bigint AS n
+                        FROM public.work_orders
+                        WHERE order_id LIKE %s AND order_id ~ %s
+                        UNION ALL
+                        SELECT end_no FROM public.order_segments
+                    ) used
+                    """,
+                    (_PREFIX_CUT, _PREFIX_LIKE, _PREFIX_PATTERN),
+                ).fetchone()[0]
+                start_no = max(next_no, used_max + 1)
+                end_no = start_no + quantity - 1
 
-    victims = [bid for bid, r in runs.items() if r.error_sqlstate == DEADLOCK_SQLSTATE]
-    lock_timeouts = [
-        bid for bid, r in runs.items()
-        if r.error_sqlstate == "55P03"
-    ]
+                conn.execute(
+                    """
+                    INSERT INTO public.order_segments
+                        (terminal_id, request_no, quantity, start_no, end_no)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (terminal_id, request_no, quantity, start_no, end_no),
+                )
+                conn.execute(
+                    "UPDATE public.allocation_meta SET next_no = %s WHERE id = 1",
+                    (end_no + 1,),
+                )
+                created = conn.execute(
+                    """
+                    SELECT created_at FROM public.order_segments
+                    WHERE terminal_id = %s AND request_no = %s
+                    """,
+                    (terminal_id, request_no),
+                ).fetchone()[0]
+                return Segment(terminal_id, request_no, quantity,
+                               start_no, end_no, retried=False,
+                               created_at=created.isoformat())
+        except psycopg.errors.UniqueViolation as exc:
+            # 并发同请求号：赢家已提交号段，回滚后重试回读
+            last_exc = exc
+            continue
+    raise last_exc  # type: ignore[misc]
 
-    # 汇总操作顺序
-    all_steps: List[ReplayStep] = sorted(
-        [s for r in runs.values() for s in r.steps],
-        key=lambda s: s.seq,
-    )
 
-    batch_waits: List[BatchWait] = []
-    for bid in cyc_batches:
-        r = runs[bid]
-        waits_order = block_order[bid]
-        batch_waits.append(
-            BatchWait(
-                batch_id=bid,
-                waits_for_order=waits_order,
-                waits_for_holder=holder_by_order[waits_order],
-                last_acquired_step=r.last_step,
+def get_segment(terminal_id: str,
+                request_no: str,
+                for_update: bool = False) -> Optional[Segment]:
+    clause = " FOR UPDATE" if for_update else ""
+    with connect() as conn:
+        if for_update:
+            conn.execute(
+                f"SET LOCAL lock_timeout = {int(settings.lock_timeout_ms)}"
             )
+        row = conn.execute(
+            f"""
+            SELECT quantity, start_no, end_no, created_at
+            FROM public.order_segments
+            WHERE terminal_id = %s AND request_no = %s{clause}
+            """,
+            (terminal_id, request_no),
+        ).fetchone()
+    if row is None:
+        return None
+    return Segment(terminal_id, request_no, row[0], row[1], row[2],
+                   retried=False, created_at=row[3].isoformat())
+
+
+# --------------------------------------------------------------------------- #
+# 补录
+# --------------------------------------------------------------------------- #
+def backfill(
+    terminal_id: str,
+    request_no: str,
+    items: Sequence[Tuple[str, str]],
+) -> Tuple[int, int, List[str]]:
+    """按号段补录工单。
+
+    返回 ``(新写入数, 同号同负责人跳过数, 涉及工单号升序列表)``。
+    校验失败抛 :class:`BackfillRejected`，事务回滚、整批不入库；
+    号段不存在抛 :class:`SegmentNotFound`。
+    """
+    ensure_business_schema()
+    with connect() as conn:  # 一笔事务，任一校验失败整体回滚
+        conn.execute(f"SET LOCAL lock_timeout = {int(settings.lock_timeout_ms)}")
+
+        seg_row = conn.execute(
+            """
+            SELECT quantity, start_no, end_no
+            FROM public.order_segments
+            WHERE terminal_id = %s AND request_no = %s
+            FOR UPDATE
+            """,
+            (terminal_id, request_no),
+        ).fetchone()
+        if seg_row is None:
+            raise SegmentNotFound(terminal_id, request_no)
+        quantity, start_no, end_no = seg_row
+
+        # 批内去重：同号同负责人合并；同号异负责人记为冲突
+        deduped: Dict[str, str] = {}
+        conflict_orders: List[str] = []
+        for order_id, assignee in items:
+            old = deduped.get(order_id)
+            if old is None:
+                deduped[order_id] = assignee
+            elif old != assignee:
+                conflict_orders.append(order_id)
+
+        out_of_range = sorted(
+            oid for oid in deduped
+            if not (start_no <= int(oid[len(settings.order_prefix):]) <= end_no)
         )
+        conflict_orders = sorted(set(conflict_orders))
 
-    reproduced = len(victims) > 0
-    if reproduced:
-        detail = (
-            f"PostgreSQL deadlock_detector 中止了批次 {sorted(victims)}，"
-            f"收到 SQLSTATE {DEADLOCK_SQLSTATE}（deadlock_detected），死锁复现成功。"
-        )
-        sqlstate = DEADLOCK_SQLSTATE
-    elif lock_timeouts:
-        detail = (
-            f"未收到 40P01：环上批次 {sorted(lock_timeouts)} 先触发了 lock_timeout"
-            f"（SQLSTATE 55P03，等待 {settings.lock_timeout_ms}ms）。"
-            "说明调度形成了真实锁等待但死锁检测未在超时前打破环；"
-            "可调大 LOCK_TIMEOUT_MS 或调小服务端 deadlock_timeout 后重试。"
-        )
-        sqlstate = "55P03"
-    elif worker_errors:
-        detail = "试跑执行异常，未能确认死锁：" + "；".join(worker_errors)
-        sqlstate = None
-    else:
-        detail = (
-            "未收到 40P01：所有批次均正常 COMMIT，调度未形成环。"
-            "可能原因：环上工单在某批中并非排他更新、或数据库未走行锁路径。"
-        )
-        sqlstate = None
+        # 库内同号异负责人冲突（种子数据或早前补录已占用该编号）；
+        # 同时记录此前已存在的同号同负责人工单数，用于幂等统计。
+        already_present = 0
+        if deduped:
+            existing = conn.execute(
+                "SELECT order_id, assignee FROM public.work_orders "
+                "WHERE order_id = ANY(%s)",
+                (list(deduped.keys()),),
+            ).fetchall()
+            for oid, assignee in existing:
+                if assignee != deduped[oid]:
+                    conflict_orders.append(oid)
+                else:
+                    already_present += 1
+            conflict_orders = sorted(set(conflict_orders))
 
-    cleanup_ok, cleanup_note = _verify_and_cleanup(admin, all_orders)
-    if not cleanup_ok:
-        detail += f" 收尾核查失败：{cleanup_note}"
+        if out_of_range or conflict_orders:
+            raise BackfillRejected(
+                out_of_range_orders=out_of_range,
+                conflict_orders=sorted(conflict_orders),
+            )
 
-    return ReplayReport(
-        reproduced=reproduced,
-        sqlstate=sqlstate,
-        victim_batch=sorted(victims)[0] if victims else None,
-        detail=detail,
-        steps=all_steps,
-        batch_waits=batch_waits,
-        cleanup_ok=cleanup_ok,
-    )
-
-
-def _verify_and_cleanup(
-    admin: psycopg.Connection,
-    order_ids: List[str],
-) -> Tuple[bool, str]:
-    """核查无残留事务，并物理销毁试跑 schema（含全部改派结果与锁）。"""
-    # 1. 无未结束的试跑事务（排除当前 admin 连接与本查询自身）
-    rows = admin.execute(
-        """
-        SELECT pid, state, xact_start
-        FROM pg_stat_activity
-        WHERE datname = current_database()
-          AND pid <> pg_backend_pid()
-          AND xact_start IS NOT NULL
-          AND state IN ('idle in transaction', 'active')
-        """
-    ).fetchall()
-    if rows:
-        return False, f"仍有未结束事务：{rows}"
-
-    # 2. 统计 DROP 前试跑表内的改派行数（死锁复现时存活方会 COMMIT，
-    # 存在已更新行是预期现象；它们随下一步 schema DROP 物理消失）。
-    dirty = admin.execute(
-        sql.SQL(
-            "SELECT count(*) FROM {tbl} WHERE assignee <> 'init'"
-        ).format(tbl=_trial_table())
-    ).fetchone()[0]
-
-    # 3. 物理销毁试跑 schema（行、锁、表全部消失）
-    admin.execute(
-        sql.SQL("DROP SCHEMA {} CASCADE").format(
-            sql.Identifier(settings.trial_schema)
-        )
-    )
-    left = admin.execute(
-        "SELECT count(*) FROM pg_namespace WHERE nspname = %s",
-        (settings.trial_schema,),
-    ).fetchone()[0]
-    if left:
-        return False, "试跑 schema 删除后仍存在"
-    return True, f"ok（DROP 前试跑表有 {dirty} 行已改派，已随 schema 清除）"
+        # 全部合法：upsert。冲突已在上面排除，ON CONFLICT 只可能命中
+        # 同号同负责人的幂等重试，DO NOTHING 即可。
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO public.work_orders(order_id, assignee, source)
+                VALUES (%s, %s, 'backfill')
+                ON CONFLICT (order_id) DO NOTHING
+                """,
+                [(oid, assignee) for oid, assignee in deduped.items()],
+            )
+        inserted = len(deduped) - already_present
+        return inserted, already_present, sorted(deduped.keys())

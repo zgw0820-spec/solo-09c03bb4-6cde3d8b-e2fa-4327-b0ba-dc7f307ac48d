@@ -13,16 +13,13 @@ class Settings:
         "DATABASE_URL",
         "postgresql://postgres:postgres@localhost:5432/patrol",
     )
-    # 试跑时使用的独立 schema，与业务数据隔离，试跑后整体清空
-    trial_schema: str = os.getenv("TRIAL_SCHEMA", "deadlock_trial")
-    # 单步锁等待上限，避免试跑线程被无限挂住
+    # 工单号前缀：完整工单号 = 前缀 + 正整数，如 OFF-123
+    order_prefix: str = os.getenv("ORDER_PREFIX", "OFF-")
+    # 单次领号数量上下限
+    min_quantity: int = int(os.getenv("MIN_QUANTITY", "1"))
+    max_quantity: int = int(os.getenv("MAX_QUANTITY", "50"))
+    # 补录事务等锁上限（毫秒）：仅作用于同段并发补录，不同段互不阻塞
     lock_timeout_ms: int = int(os.getenv("LOCK_TIMEOUT_MS", "10000"))
-    # 试跑整体超时
-    trial_timeout_s: float = float(os.getenv("TRIAL_TIMEOUT_S", "30"))
-    # 业务校验常量
-    min_batches: int = 2
-    max_batches: int = 3
-    max_orders_per_batch: int = 6
 
 
 settings = Settings()

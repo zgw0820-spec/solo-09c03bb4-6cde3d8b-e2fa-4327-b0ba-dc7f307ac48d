@@ -36,9 +36,7 @@ start() {
 port = ${PORT}
 listen_addresses = '127.0.0.1'
 unix_socket_directories = '/tmp'
-deadlock_timeout = '200ms'
 lock_timeout = '10s'
-log_lock_waits = on
 EOF
   fi
   if ! "${PGBIN}/pg_isready" -h 127.0.0.1 -p "${PORT}" -U postgres >/dev/null 2>&1; then
